@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This file contains the internal implementation of `run`.
+//! Implementation of `jj run` — run a command across a set of revisions.
 
 use std::collections::HashMap;
 use std::fs;
@@ -23,6 +23,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 use crossterm::ExecutableCommand as _;
@@ -39,6 +42,8 @@ use jj_lib::backend::BackendError;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::commit::CommitIteratorExt as _;
+use jj_lib::copies::CopyRecords;
+use jj_lib::diff_presentation::LineCompareMode;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateError;
@@ -46,6 +51,7 @@ use jj_lib::local_working_copy::TreeStateSettings;
 use jj_lib::lock::FileLock;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::NothingMatcher;
+use jj_lib::merge::Diff;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
@@ -54,25 +60,34 @@ use jj_lib::working_copy::SnapshotError;
 use jj_lib::working_copy::SnapshotOptions;
 use ratatui::Terminal;
 use ratatui::layout::Constraint;
-use ratatui::layout::Direction;
 use ratatui::layout::Layout;
+use ratatui::layout::Spacing;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
+use ratatui::symbols::merge::MergeStrategy;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
-use ratatui::widgets::Borders;
 use ratatui::widgets::List;
 use ratatui::widgets::ListState;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Scrollbar;
+use ratatui::widgets::ScrollbarOrientation;
+use ratatui::widgets::ScrollbarState;
 use ratatui::widgets::Wrap;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
+use crate::cli_util::WorkspaceCommandHelper;
 use crate::command_error::CommandError;
+use crate::diff_util;
 use crate::ui::Ui;
+
+// =============================================================================
+// Command definition
+// =============================================================================
 
 /// Run a command across a set of revisions.
 ///
@@ -114,26 +129,22 @@ pub struct RunArgs {
     #[arg(long, short)]
     jobs: Option<usize>,
 
-    /// Remove cached working copies before running. By default, working
-    /// copies are reused between invocations so that ignored files (like
-    /// build artifacts) persist for incremental builds.
+    /// Remove cached working copies before running.
     #[arg(long)]
     clean: bool,
 
-    /// Don't rewrite commits. The command's exit code is reported but any
-    /// file changes are ignored. Useful for running tests or builds across
-    /// revisions without modifying the repo.
+    /// Don't rewrite commits; just run the command and report results.
     #[arg(long)]
     readonly: bool,
 
-    /// Keep going even if the command fails on some revisions. Failed
-    /// commits are left unmodified. A summary of failures is reported at
-    /// the end.
+    /// Keep going even if the command fails on some revisions.
     #[arg(long, short = 'k')]
     keep_going: bool,
 }
 
-// --- Error types ---
+// =============================================================================
+// Errors
+// =============================================================================
 
 #[derive(Debug, thiserror::Error)]
 enum RunError {
@@ -144,14 +155,13 @@ enum RunError {
         cmd: String,
         status: std::process::ExitStatus,
         commit: CommitId,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        new_tree: Option<MergedTree>,
     },
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("Failed to create path {}: {source}", path.display())]
     PathCreation { path: PathBuf, source: io::Error },
-    #[error("Failed to acquire lock on run directory: {0}")]
+    #[error("Failed to acquire lock: {0}")]
     Lock(#[from] jj_lib::lock::FileLockError),
     #[error(transparent)]
     TreeState(#[from] TreeStateError),
@@ -167,7 +177,9 @@ impl From<RunError> for CommandError {
     }
 }
 
-// --- Core execution ---
+// =============================================================================
+// Worker execution
+// =============================================================================
 
 fn get_shell() -> (&'static str, &'static str) {
     if cfg!(target_os = "windows") {
@@ -177,95 +189,251 @@ fn get_shell() -> (&'static str, &'static str) {
     }
 }
 
-/// Result of running a command on a commit, including captured output.
-struct RunOutput {
-    new_tree: Option<MergedTree>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn run_command_on_commit(
-    tree_state: &mut TreeState,
-    shell_command: &str,
-    commit: &Commit,
-    base_ignores: Arc<GitIgnoreFile>,
-    readonly: bool,
-) -> Result<RunOutput, RunError> {
-    tree_state.check_out(&commit.tree())?;
-
-    let output = {
-        let (prog, first_arg) = get_shell();
-        Command::new(prog)
-            .arg(first_arg)
-            .arg(shell_command)
-            .current_dir(tree_state.working_copy_path())
-            .env("JJ_CHANGE", commit.change_id().hex())
-            .env("JJ_COMMIT", commit.id().hex())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?
-    };
-
-    if !output.status.success() {
-        return Err(RunError::CommandFailure {
-            cmd: shell_command.to_owned(),
-            status: output.status,
-            commit: commit.id().clone(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
-    }
-
-    if readonly {
-        return Ok(RunOutput { new_tree: None, stdout: output.stdout, stderr: output.stderr });
-    }
-
-    let options = SnapshotOptions {
-        base_ignores,
-        start_tracking_matcher: &EverythingMatcher,
-        progress: None,
-        max_new_file_size: 64_000_000,
-        force_tracking_matcher: &NothingMatcher,
-    };
-    let (dirty, _) = pollster::FutureExt::block_on(tree_state.snapshot(&options))?;
-    Ok(RunOutput {
-        new_tree: if dirty { Some(tree_state.current_tree().clone()) } else { None },
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-}
-
-fn ensure_dir(path: &PathBuf) -> Result<(), RunError> {
-    if !path.exists() {
-        fs::create_dir_all(path)
-            .map_err(|e| RunError::PathCreation { path: path.clone(), source: e })?;
-    }
-    Ok(())
-}
-
 fn init_or_load_tree_state(
     store: Arc<jj_lib::store::Store>,
     working_copy_dir: &PathBuf,
     state_dir: &PathBuf,
     settings: &TreeStateSettings,
 ) -> Result<TreeState, RunError> {
-    ensure_dir(working_copy_dir)?;
-    ensure_dir(state_dir)?;
-    let tree_state_path = state_dir.join("tree_state");
-    if tree_state_path.exists() {
+    fs::create_dir_all(working_copy_dir)
+        .map_err(|e| RunError::PathCreation { path: working_copy_dir.clone(), source: e })?;
+    fs::create_dir_all(state_dir)
+        .map_err(|e| RunError::PathCreation { path: state_dir.clone(), source: e })?;
+    if state_dir.join("tree_state").exists() {
         Ok(TreeState::load(store, working_copy_dir.clone(), state_dir.clone(), settings)?)
     } else {
         Ok(TreeState::init(store, working_copy_dir.clone(), state_dir.clone(), settings)?)
     }
 }
 
-// --- TUI types ---
+fn make_snapshot_options(base_ignores: Arc<GitIgnoreFile>) -> SnapshotOptions<'static> {
+    SnapshotOptions {
+        base_ignores,
+        start_tracking_matcher: &EverythingMatcher,
+        progress: None,
+        max_new_file_size: 64_000_000,
+        force_tracking_matcher: &NothingMatcher,
+    }
+}
+
+/// Spawn a thread that reads from `reader` line-by-line and sends tagged
+/// output lines to the TUI channel.
+fn spawn_pipe_reader(
+    reader: impl io::Read + Send + 'static,
+    commit_id: CommitId,
+    tx: mpsc::Sender<TuiMessage>,
+    make_line: fn(Vec<u8>) -> OutputLine,
+) -> std::thread::JoinHandle<()> {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        for line in io::BufReader::new(reader).split(b'\n') {
+            if let Ok(data) = line {
+                tx.send(TuiMessage::Output {
+                    commit_id: commit_id.clone(),
+                    line: make_line(data),
+                })
+                .ok();
+            }
+        }
+    })
+}
+
+/// Run a shell command on a commit. Streams output to the TUI, periodically
+/// snapshots for live diff stats, and returns the new tree (if modified).
+fn run_command_on_commit(
+    tree_state: &mut TreeState,
+    shell_command: &str,
+    commit: &Commit,
+    base_ignores: Arc<GitIgnoreFile>,
+    readonly: bool,
+    tui_tx: &mpsc::Sender<TuiMessage>,
+    new_trees: &Mutex<HashMap<CommitId, MergedTree>>,
+) -> Result<Option<MergedTree>, RunError> {
+    tree_state.check_out(&commit.tree())?;
+
+    let cid = commit.id().clone();
+    let (prog, first_arg) = get_shell();
+    let mut child = Command::new(prog)
+        .arg(first_arg)
+        .arg(shell_command)
+        .current_dir(tree_state.working_copy_path())
+        .env("JJ_CHANGE", commit.change_id().hex())
+        .env("JJ_COMMIT", commit.id().hex())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let h1 = spawn_pipe_reader(
+        child.stdout.take().unwrap(), cid.clone(), tui_tx.clone(), OutputLine::Stdout,
+    );
+    let h2 = spawn_pipe_reader(
+        child.stderr.take().unwrap(), cid.clone(), tui_tx.clone(), OutputLine::Stderr,
+    );
+
+    // Periodically snapshot while the command runs, for live diff stats.
+    let original_tree = commit.tree();
+    let snap_opts = make_snapshot_options(base_ignores);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if !readonly {
+            let (dirty, _) = pollster::FutureExt::block_on(tree_state.snapshot(&snap_opts))?;
+            if dirty {
+                let current = tree_state.current_tree().clone();
+                let stat = compute_stat(&original_tree, &current);
+                new_trees.lock().unwrap().insert(cid.clone(), current);
+                tui_tx
+                    .send(TuiMessage::DiffStat { commit_id: cid.clone(), stat })
+                    .ok();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    };
+
+    h1.join().ok();
+    h2.join().ok();
+
+    // Final snapshot.
+    let new_tree = if !readonly {
+        let (dirty, _) = pollster::FutureExt::block_on(tree_state.snapshot(&snap_opts))?;
+        if dirty { Some(tree_state.current_tree().clone()) } else { None }
+    } else {
+        None
+    };
+
+    if !status.success() {
+        return Err(RunError::CommandFailure {
+            cmd: shell_command.to_owned(),
+            status,
+            commit: commit.id().clone(),
+            new_tree,
+        });
+    }
+
+    Ok(new_tree)
+}
+
+// =============================================================================
+// Diff / stat helpers
+// =============================================================================
+
+/// Compute line-level stat string: `[N:+A-R]` (files, lines added/removed).
+fn compute_stat(before: &MergedTree, after: &MergedTree) -> String {
+    let store = before.store();
+    let options = diff_util::DiffStatOptions {
+        line_diff: diff_util::LineDiffOptions {
+            compare_mode: LineCompareMode::Exact,
+        },
+    };
+    let result = pollster::FutureExt::block_on(async {
+        let copy_records = CopyRecords::default();
+        let tree_diff =
+            before.diff_stream_with_copies(after, &EverythingMatcher, &copy_records);
+        diff_util::DiffStats::calculate(
+            store,
+            tree_diff,
+            &options,
+            jj_lib::conflicts::ConflictMarkerStyle::Snapshot,
+        )
+        .await
+    });
+    let Ok(stats) = result else {
+        return String::new();
+    };
+    let files = stats.entries().len();
+    if files == 0 {
+        return String::new();
+    }
+    let added = stats.count_total_added();
+    let removed = stats.count_total_removed();
+    let mut s = format!("[{files}:");
+    if added > 0 {
+        s.push_str(&format!("+{added}"));
+    }
+    if removed > 0 {
+        s.push_str(&format!("-{removed}"));
+    }
+    if added == 0 && removed == 0 {
+        s.push('~');
+    }
+    s.push(']');
+    s
+}
+
+/// Render a full diff to bytes using jj's built-in color-words diff, and
+/// compute the line stat.
+fn compute_diff(
+    ui: &Ui,
+    workspace_command: &WorkspaceCommandHelper,
+    before: &MergedTree,
+    after: &MergedTree,
+) -> (Vec<u8>, String) {
+    let diff_bytes = (|| -> Result<Vec<u8>, CommandError> {
+        let options =
+            diff_util::ColorWordsDiffOptions::from_settings(workspace_command.settings())?;
+        let formats = vec![diff_util::DiffFormat::ColorWords(Box::new(options))];
+        let diff_renderer = workspace_command.diff_renderer(formats);
+        let mut buf = Vec::new();
+        {
+            let mut formatter = ui.new_formatter(&mut buf);
+            pollster::FutureExt::block_on(diff_renderer.show_diff(
+                ui,
+                formatter.as_mut(),
+                Diff::new(before, after),
+                &EverythingMatcher,
+                &CopyRecords::default(),
+                80,
+            ))?;
+        }
+        Ok(buf)
+    })()
+    .unwrap_or_else(|e| format!("(error: {e:?})").into_bytes());
+
+    let stat = compute_stat(before, after);
+    (diff_bytes, stat)
+}
+
+/// Look up a commit's new tree and compute its diff + stat, storing the
+/// results in the entry. Returns true if a diff was computed.
+fn ensure_diff_rendered(
+    entry: &mut CommitEntry,
+    commits: &[Commit],
+    new_trees: &Mutex<HashMap<CommitId, MergedTree>>,
+    ui: &Ui,
+    workspace_command: &WorkspaceCommandHelper,
+) -> bool {
+    let new_tree = new_trees.lock().unwrap().get(&entry.commit_id).cloned();
+    if let Some(new_tree) = new_tree {
+        if let Some(commit) = commits.iter().find(|c| c.id() == &entry.commit_id) {
+            let (diff_bytes, stat) =
+                compute_diff(ui, workspace_command, &commit.tree(), &new_tree);
+            entry.diff_bytes = Some(diff_bytes);
+            entry.diff_stat = Some(stat);
+            return true;
+        }
+    }
+    false
+}
+
+// =============================================================================
+// TUI types
+// =============================================================================
+
+/// A line of output tagged with its source.
+#[derive(Clone, Debug)]
+enum OutputLine {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
 
 /// Message from worker → TUI.
 enum TuiMessage {
     Started { commit_id: CommitId, worker: usize },
-    Passed { commit_id: CommitId, modified: bool, stdout: Vec<u8>, stderr: Vec<u8>, diff_summary: String },
-    Failed { commit_id: CommitId, message: String, stdout: Vec<u8>, stderr: Vec<u8> },
+    Output { commit_id: CommitId, line: OutputLine },
+    DiffStat { commit_id: CommitId, stat: String },
+    Passed { commit_id: CommitId, modified: bool },
+    Failed { commit_id: CommitId, message: String },
     AllDone,
 }
 
@@ -282,27 +450,30 @@ struct CommitEntry {
     change_id_hex: String,
     description: String,
     status: JobStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    /// Summary of file changes (populated for modified commits).
-    diff_summary: String,
+    output: Vec<OutputLine>,
+    diff_bytes: Option<Vec<u8>>,
+    diff_stat: Option<String>,
 }
 
+/// Which bottom panel has focus for scrolling.
 #[derive(Clone, Copy, PartialEq)]
-enum DetailView { None, Stdout, Stderr, Diff }
+enum FocusPanel {
+    Output,
+    Diff,
+}
 
-/// What the user decided in the TUI.
 enum TuiOutcome {
-    /// Apply changes and quit.
     Confirm,
-    /// Discard changes and quit.
     Cancel,
 }
 
 struct TuiState {
     commits: Vec<CommitEntry>,
+    index: HashMap<CommitId, usize>,
     selected: usize,
-    detail: DetailView,
+    focus: FocusPanel,
+    output_scroll: u16,
+    diff_scroll: u16,
     done: bool,
     outcome: Option<TuiOutcome>,
     passed: usize,
@@ -311,18 +482,30 @@ struct TuiState {
 
 impl TuiState {
     fn new(commits: &[Commit]) -> Self {
-        TuiState {
-            commits: commits.iter().map(|c| CommitEntry {
+        let entries: Vec<CommitEntry> = commits
+            .iter()
+            .map(|c| CommitEntry {
                 commit_id: c.id().clone(),
                 change_id_hex: c.change_id().hex(),
                 description: c.description().lines().next().unwrap_or("").to_string(),
                 status: JobStatus::Pending,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                diff_summary: String::new(),
-            }).collect(),
+                output: Vec::new(),
+                diff_bytes: None,
+                diff_stat: None,
+            })
+            .collect();
+        let index = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.commit_id.clone(), i))
+            .collect();
+        TuiState {
+            commits: entries,
+            index,
             selected: 0,
-            detail: DetailView::None,
+            focus: FocusPanel::Output,
+            output_scroll: 0,
+            diff_scroll: 0,
             done: false,
             outcome: None,
             passed: 0,
@@ -331,7 +514,7 @@ impl TuiState {
     }
 
     fn find_mut(&mut self, id: &CommitId) -> Option<&mut CommitEntry> {
-        self.commits.iter_mut().find(|c| c.commit_id == *id)
+        self.index.get(id).copied().map(|i| &mut self.commits[i])
     }
 
     fn handle_message(&mut self, msg: TuiMessage) {
@@ -341,20 +524,32 @@ impl TuiState {
                     e.status = JobStatus::Running(worker);
                 }
             }
-            TuiMessage::Passed { commit_id, modified, stdout, stderr, diff_summary } => {
+            TuiMessage::DiffStat { commit_id, stat } => {
+                if let Some(e) = self.find_mut(&commit_id) {
+                    e.diff_stat = Some(stat);
+                }
+            }
+            TuiMessage::Output { commit_id, line } => {
+                let is_selected = self
+                    .commits
+                    .get(self.selected)
+                    .is_some_and(|c| c.commit_id == commit_id);
+                if let Some(e) = self.find_mut(&commit_id) {
+                    e.output.push(line);
+                }
+                if is_selected {
+                    self.output_scroll = u16::MAX; // auto-follow
+                }
+            }
+            TuiMessage::Passed { commit_id, modified } => {
                 if let Some(e) = self.find_mut(&commit_id) {
                     e.status = JobStatus::Passed { modified };
-                    e.stdout = stdout;
-                    e.stderr = stderr;
-                    e.diff_summary = diff_summary;
                 }
                 self.passed += 1;
             }
-            TuiMessage::Failed { commit_id, message, stdout, stderr } => {
+            TuiMessage::Failed { commit_id, message } => {
                 if let Some(e) = self.find_mut(&commit_id) {
                     e.status = JobStatus::Failed(message);
-                    e.stdout = stdout;
-                    e.stderr = stderr;
                 }
                 self.failed += 1;
             }
@@ -365,7 +560,85 @@ impl TuiState {
     }
 }
 
-// --- TUI rendering ---
+// =============================================================================
+// TUI rendering
+// =============================================================================
+
+/// Render an OutputLine to ratatui Lines, preserving ANSI colors. Stderr
+/// lines without ANSI styling are rendered in red.
+fn render_output_line(ol: &OutputLine) -> Vec<Line<'static>> {
+    let (data, is_stderr) = match ol {
+        OutputLine::Stdout(d) => (d, false),
+        OutputLine::Stderr(d) => (d, true),
+    };
+    if let Ok(text) = ansi_to_tui::IntoText::into_text(data) {
+        if is_stderr {
+            text.lines
+                .into_iter()
+                .map(|line| {
+                    let has_style =
+                        line.spans.iter().any(|s| s.style != Style::default());
+                    if has_style {
+                        line
+                    } else {
+                        Line::from(
+                            line.spans
+                                .into_iter()
+                                .map(|s| Span::styled(s.content, s.style.fg(Color::Red)))
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                })
+                .collect()
+        } else {
+            text.lines
+        }
+    } else {
+        let s = String::from_utf8_lossy(data).to_string();
+        let style = if is_stderr {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        vec![Line::styled(s, style)]
+    }
+}
+
+/// Render a scrollable paragraph panel with a scrollbar.
+fn render_panel(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    text: ratatui::text::Text<'_>,
+    scroll: u16,
+    block: Block<'_>,
+) -> u16 {
+    let inner = block.inner(area);
+    let line_count = text.lines.len() as u16;
+    let panel_height = inner.height;
+    let max_scroll = line_count.saturating_sub(panel_height);
+    let scroll = scroll.min(max_scroll);
+    let p = Paragraph::new(text)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(p, area);
+
+    if line_count > panel_height {
+        let sb_area = ratatui::layout::Rect {
+            x: area.x + area.width - 1,
+            y: inner.y,
+            width: 1,
+            height: panel_height,
+        };
+        let mut sb_state = ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            sb_area,
+            &mut sb_state,
+        );
+    }
+    max_scroll
+}
 
 fn render_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -373,112 +646,220 @@ fn render_tui(
     shell_command: &str,
 ) -> io::Result<()> {
     terminal.draw(|frame| {
-        let show_detail = state.detail != DetailView::None;
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if show_detail {
-                vec![Constraint::Length(1), Constraint::Percentage(50), Constraint::Percentage(50), Constraint::Length(1)]
-            } else {
-                vec![Constraint::Length(1), Constraint::Fill(1), Constraint::Length(0), Constraint::Length(1)]
-            })
-            .split(frame.area());
+        // Shrink commit list to fit content + 1 line padding, but at least 3 lines.
+        let commit_rows = (state.commits.len() as u16 + 1).max(3);
 
-        // Header
-        let done = state.passed + state.failed;
-        let total = state.commits.len();
-        let header = Line::from(vec![
-            Span::styled(format!(" jj run '{shell_command}' "), Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("[{done}/{total}] ")),
-            Span::styled(format!("{} passed", state.passed), Style::default().fg(Color::Green)),
-            if state.failed > 0 {
-                Span::styled(format!(" {} failed", state.failed), Style::default().fg(Color::Red))
-            } else {
-                Span::raw("")
-            },
-        ]);
-        frame.render_widget(header, chunks[0]);
-
-        // Commit list
-        let items: Vec<Line> = state.commits.iter().enumerate().map(|(i, e)| {
-            let short = &e.change_id_hex[..8.min(e.change_id_hex.len())];
-            let desc = if e.description.is_empty() { "(no description)" } else { &e.description };
-            let (sym, style) = match &e.status {
-                JobStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
-                JobStatus::Running(_) => ("◑", Style::default().fg(Color::Yellow)),
-                JobStatus::Passed { modified: true } => ("●", Style::default().fg(Color::Green)),
-                JobStatus::Passed { modified: false } => ("○", Style::default().fg(Color::Green)),
-                JobStatus::Failed(_) => ("✗", Style::default().fg(Color::Red)),
-            };
-            let sel = if i == state.selected { "▸ " } else { "  " };
-            Line::from(vec![
-                Span::raw(sel),
-                Span::styled(format!("{sym} "), style),
-                Span::styled(format!("{short} "), Style::default().fg(Color::Magenta)),
-                Span::styled(desc.to_string(), style),
+        // Vertical: commits | bottom panels | help
+        let [commits_area, bottom_area, help_area] =
+            Layout::vertical([
+                Constraint::Length(commit_rows + 2), // +2 for borders
+                Constraint::Fill(1),
+                Constraint::Length(1),
             ])
-        }).collect();
+            .spacing(Spacing::Overlap(1))
+            .areas(frame.area());
 
-        let list = List::new(items).block(Block::default().borders(Borders::NONE));
+        // Check if the selected commit has a diff to show.
+        let selected_has_diff = state.commits.get(state.selected)
+            .and_then(|e| e.diff_bytes.as_ref())
+            .is_some_and(|b| !b.is_empty());
+
+        // Commit list title includes the run status.
+        let items: Vec<Line> = state
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let short = &e.change_id_hex[..8.min(e.change_id_hex.len())];
+                let desc = if e.description.is_empty() { "(no description)" } else { &e.description };
+                let (sym, style) = match &e.status {
+                    JobStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
+                    JobStatus::Running(_) => ("◑", Style::default().fg(Color::Yellow)),
+                    JobStatus::Passed { modified: true } => ("●", Style::default().fg(Color::Green)),
+                    JobStatus::Passed { modified: false } => ("○", Style::default().fg(Color::Green)),
+                    JobStatus::Failed(_) => ("✗", Style::default().fg(Color::Red)),
+                };
+                let sel = if i == state.selected { "▸ " } else { "  " };
+                let mut spans = vec![
+                    Span::raw(sel),
+                    Span::styled(format!("{sym} "), style),
+                    Span::styled(format!("{short} "), Style::default().fg(Color::Magenta)),
+                    Span::styled(desc.to_string(), style),
+                ];
+                if let Some(ref stat) = e.diff_stat {
+                    if !stat.is_empty() {
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(stat.clone(), Style::default().fg(Color::Cyan)));
+                    }
+                }
+                Line::from(spans)
+            })
+            .collect();
+
+        let done_count = state.passed + state.failed;
+        let total = state.commits.len();
+        let mut title_spans = vec![
+            Span::styled(
+                format!(" jj run '{shell_command}' "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("[{done_count}/{total}] ")),
+            Span::styled(format!("{} passed", state.passed), Style::default().fg(Color::Green)),
+        ];
+        if state.failed > 0 {
+            title_spans.push(Span::styled(
+                format!(" {} failed", state.failed),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        title_spans.push(Span::raw(" "));
+        let commits_block = Block::bordered()
+            .title(Line::from(title_spans))
+            .merge_borders(MergeStrategy::Exact);
+        let list = List::new(items).block(commits_block);
         let mut list_state = ListState::default().with_selected(Some(state.selected));
-        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+        frame.render_stateful_widget(list, commits_area, &mut list_state);
 
-        // Detail panel
-        if show_detail {
-            let e = &state.commits[state.selected];
-            let (title, content) = match state.detail {
-                DetailView::Stdout => ("stdout (o: close, e: stderr, d: diff)", String::from_utf8_lossy(&e.stdout).to_string()),
-                DetailView::Stderr => ("stderr (e: close, o: stdout, d: diff)", String::from_utf8_lossy(&e.stderr).to_string()),
-                DetailView::Diff => ("diff (d: close, o: stdout, e: stderr)",
-                    if e.diff_summary.is_empty() { "(no changes)".to_string() } else { e.diff_summary.clone() }),
-                DetailView::None => unreachable!(),
+        // Output (always shown) and diff (only if selected commit has changes).
+        let e = &state.commits[state.selected];
+        let mut output_lines: Vec<Line> = Vec::new();
+        for ol in &e.output {
+            output_lines.extend(render_output_line(ol));
+        }
+        if output_lines.is_empty() {
+            output_lines.push(Line::styled("(no output)", Style::default().fg(Color::DarkGray)));
+        }
+
+        if selected_has_diff {
+            let [output_area, diff_area] = Layout::horizontal([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .spacing(Spacing::Overlap(1))
+            .areas(bottom_area);
+
+            let output_title = if state.focus == FocusPanel::Output { " output ◀ " } else { " output " };
+            let output_block = Block::bordered()
+                .title(output_title)
+                .merge_borders(MergeStrategy::Exact);
+            render_panel(
+                frame, output_area,
+                ratatui::text::Text::from(output_lines),
+                state.output_scroll,
+                output_block,
+            );
+
+            let diff_text = if let Some(ref bytes) = e.diff_bytes {
+                if let Ok(t) = ansi_to_tui::IntoText::into_text(bytes) {
+                    t
+                } else {
+                    ratatui::text::Text::raw(String::from_utf8_lossy(bytes).to_string())
+                }
+            } else {
+                ratatui::text::Text::raw("")
             };
-            let p = Paragraph::new(content)
-                .block(Block::default().title(title).borders(Borders::TOP))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(p, chunks[2]);
+            let diff_title = if state.focus == FocusPanel::Diff { " diff ◀ " } else { " diff " };
+            let diff_block = Block::bordered()
+                .title(diff_title)
+                .merge_borders(MergeStrategy::Exact);
+            render_panel(
+                frame, diff_area,
+                diff_text,
+                state.diff_scroll,
+                diff_block,
+            );
+        } else {
+            // No diff — output takes the full width.
+            let output_block = Block::bordered()
+                .title(" output ")
+                .merge_borders(MergeStrategy::Exact);
+            render_panel(
+                frame, bottom_area,
+                ratatui::text::Text::from(output_lines),
+                state.output_scroll,
+                output_block,
+            );
         }
 
         // Help bar
         let mut help_spans = vec![
-            Span::styled("↑/↓", Style::default().fg(Color::Magenta)), Span::raw(" nav "),
-            Span::styled("o", Style::default().fg(Color::Magenta)), Span::raw(" stdout "),
-            Span::styled("e", Style::default().fg(Color::Magenta)), Span::raw(" stderr "),
-            Span::styled("d", Style::default().fg(Color::Magenta)), Span::raw(" diff "),
+            Span::styled("↑/↓", Style::default().fg(Color::Magenta)),
+            Span::raw(" nav "),
+            Span::styled("Tab", Style::default().fg(Color::Magenta)),
+            Span::raw(" focus "),
+            Span::styled("PgUp/Dn", Style::default().fg(Color::Magenta)),
+            Span::raw(" scroll "),
         ];
         if state.done {
             help_spans.extend([
-                Span::styled("c", Style::default().fg(Color::Green)), Span::raw(" confirm "),
-                Span::styled("q", Style::default().fg(Color::Red)), Span::raw(" discard"),
+                Span::styled("c", Style::default().fg(Color::Green)),
+                Span::raw(" confirm "),
+                Span::styled("q", Style::default().fg(Color::Red)),
+                Span::raw(" discard"),
             ]);
         } else {
             help_spans.extend([
-                Span::styled("q", Style::default().fg(Color::Magenta)), Span::raw(" cancel"),
+                Span::styled("q", Style::default().fg(Color::Magenta)),
+                Span::raw(" cancel"),
             ]);
         }
-        let help = Line::from(help_spans);
-        frame.render_widget(help, chunks[3]);
+        frame.render_widget(Line::from(help_spans), help_area);
     })?;
     Ok(())
 }
+
+// =============================================================================
+// TUI event loop
+// =============================================================================
 
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
     rx: &mpsc::Receiver<TuiMessage>,
     shell_command: &str,
+    ui: &Ui,
+    workspace_command: &WorkspaceCommandHelper,
+    commits: &[Commit],
+    new_trees: &Mutex<HashMap<CommitId, MergedTree>>,
 ) {
     loop {
         render_tui(terminal, state, shell_command).ok();
 
-        // Drain worker messages.
+        // Drain worker messages, compute diffs for finished/updated commits.
         while let Ok(msg) = rx.try_recv() {
+            let render_diff_for = match &msg {
+                TuiMessage::Passed { modified: true, commit_id, .. }
+                | TuiMessage::Failed { commit_id, .. } => Some(commit_id.clone()),
+                TuiMessage::DiffStat { commit_id, .. }
+                    if state.commits.get(state.selected)
+                        .is_some_and(|c| c.commit_id == *commit_id) =>
+                {
+                    Some(commit_id.clone())
+                }
+                _ => None,
+            };
+
             state.handle_message(msg);
+
+            if let Some(cid) = render_diff_for {
+                if let Some(entry) = state.find_mut(&cid) {
+                    ensure_diff_rendered(entry, commits, new_trees, ui, workspace_command);
+                }
+            }
         }
 
-        // Poll keyboard with timeout.
+        // Ensure the selected commit's diff is always rendered.
+        let entry = &mut state.commits[state.selected];
+        if entry.diff_bytes.is_none() {
+            ensure_diff_rendered(entry, commits, new_trees, ui, workspace_command);
+        }
+
+        // Poll keyboard.
         if crossterm::event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
             if let Ok(Event::Key(key)) = crossterm::event::read() {
-                if key.is_release() { continue; }
+                if key.is_release() {
+                    continue;
+                }
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
                         state.outcome = Some(TuiOutcome::Cancel);
@@ -493,32 +874,51 @@ fn run_tui_loop(
                         return;
                     }
                     (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
-                        if state.selected + 1 < state.commits.len() { state.selected += 1; }
+                        if state.selected + 1 < state.commits.len() {
+                            state.selected += 1;
+                            state.output_scroll = u16::MAX; // auto-follow new selection
+                            state.diff_scroll = 0;
+                        }
                     }
                     (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
-                        if state.selected > 0 { state.selected -= 1; }
+                        if state.selected > 0 {
+                            state.selected -= 1;
+                            state.output_scroll = u16::MAX;
+                            state.diff_scroll = 0;
+                        }
                     }
-                    (KeyCode::Char('o'), _) => {
-                        state.detail = if state.detail == DetailView::Stdout { DetailView::None } else { DetailView::Stdout };
+                    (KeyCode::Tab, _) => {
+                        state.focus = match state.focus {
+                            FocusPanel::Output => FocusPanel::Diff,
+                            FocusPanel::Diff => FocusPanel::Output,
+                        };
                     }
-                    (KeyCode::Char('e'), _) => {
-                        state.detail = if state.detail == DetailView::Stderr { DetailView::None } else { DetailView::Stderr };
+                    (KeyCode::PageDown, _) => {
+                        match state.focus {
+                            FocusPanel::Output => state.output_scroll = state.output_scroll.saturating_add(10),
+                            FocusPanel::Diff => state.diff_scroll = state.diff_scroll.saturating_add(10),
+                        }
                     }
-                    (KeyCode::Char('d'), _) => {
-                        state.detail = if state.detail == DetailView::Diff { DetailView::None } else { DetailView::Diff };
+                    (KeyCode::PageUp, _) => {
+                        match state.focus {
+                            FocusPanel::Output => state.output_scroll = state.output_scroll.saturating_sub(10),
+                            FocusPanel::Diff => state.diff_scroll = state.diff_scroll.saturating_sub(10),
+                        }
                     }
                     _ => {}
                 }
             }
         }
 
-        if let Some(_) = &state.outcome {
+        if state.outcome.is_some() {
             return;
         }
     }
 }
 
-// --- Main command ---
+// =============================================================================
+// Main command
+// =============================================================================
 
 pub async fn cmd_run(
     ui: &mut Ui,
@@ -553,13 +953,15 @@ pub async fn cmd_run(
     let base_ignores = workspace_command.base_ignores()?;
     let tree_state_settings =
         TreeStateSettings::try_from_user_settings(workspace_command.settings())?;
+    let store = workspace_command.repo().store().clone();
 
+    // Lock the run directory to prevent concurrent jj run.
     let repo_path = workspace_command.repo_path().to_owned();
     let run_base = repo_path.parent().unwrap().join("run");
-    ensure_dir(&run_base)?;
+    fs::create_dir_all(&run_base)?;
     let _lock = FileLock::lock(run_base.join("lock")).map_err(RunError::Lock)?;
 
-    if args.clean && run_base.exists() {
+    if args.clean {
         for entry in fs::read_dir(&run_base)? {
             let entry = entry?;
             if entry.file_name() != "lock" {
@@ -568,24 +970,20 @@ pub async fn cmd_run(
         }
     }
 
+    // Shared state between workers and TUI.
+    let (tx, rx) = mpsc::channel::<TuiMessage>();
+    let new_trees: Arc<Mutex<HashMap<CommitId, MergedTree>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let errors: Arc<Mutex<Vec<RunError>>> = Arc::new(Mutex::new(Vec::new()));
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let queue: Arc<Mutex<std::vec::IntoIter<Commit>>> =
+        Arc::new(Mutex::new(resolved_commits.clone().into_iter()));
+
     let shell_command = args.shell_command.clone();
     let keep_going = args.keep_going;
     let readonly = args.readonly;
-    let store = workspace_command.repo().store().clone();
 
-    // Workers send TUI messages via this channel.
-    let (tx, rx) = mpsc::channel::<TuiMessage>();
-    // Workers store new trees here for post-run rewriting.
-    let new_trees: Arc<std::sync::Mutex<HashMap<CommitId, MergedTree>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    // Workers store errors here for post-run reporting.
-    let errors: Arc<std::sync::Mutex<Vec<RunError>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let should_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let queue: Arc<std::sync::Mutex<std::vec::IntoIter<Commit>>> =
-        Arc::new(std::sync::Mutex::new(resolved_commits.clone().into_iter()));
-
-    // Spawn worker manager in a background thread.
+    // Spawn workers in a background thread.
     let worker_handle = {
         let tx = tx.clone();
         let queue = queue.clone();
@@ -615,69 +1013,72 @@ pub async fn cmd_run(
                         let wc_dir = worker_dir.join("working_copy");
                         let state_dir = worker_dir.join("state");
 
-                        let ts = init_or_load_tree_state(
-                            store.clone(), &wc_dir, &state_dir, tree_state_settings,
-                        );
-                        let mut ts = match ts {
+                        let mut ts = match init_or_load_tree_state(
+                            store.clone(),
+                            &wc_dir,
+                            &state_dir,
+                            tree_state_settings,
+                        ) {
                             Ok(ts) => ts,
                             Err(e) => {
-                                should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                should_stop.store(true, Ordering::Relaxed);
                                 errors.lock().unwrap().push(e);
                                 return;
                             }
                         };
 
                         loop {
-                            if should_stop.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                            if should_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
                             let commit = { queue.lock().unwrap().next() };
                             let Some(commit) = commit else { break };
                             let cid = commit.id().clone();
 
-                            tx.send(TuiMessage::Started { commit_id: cid.clone(), worker: worker_id }).ok();
+                            tx.send(TuiMessage::Started {
+                                commit_id: cid.clone(),
+                                worker: worker_id,
+                            })
+                            .ok();
 
-                            match run_command_on_commit(&mut ts, shell_command, &commit, base_ignores.clone(), readonly) {
-                                Ok(out) => {
-                                    let modified = out.new_tree.is_some();
-                                    let diff_summary = if let Some(ref tree) = out.new_tree {
-                                        use futures::StreamExt as _;
-                                        pollster::FutureExt::block_on(async {
-                                            let mut summary = String::new();
-                                            let mut stream = commit.tree().diff_stream(tree, &EverythingMatcher);
-                                            while let Some(entry) = stream.next().await {
-                                                let path = entry.path.as_ref();
-                                                if let Ok(diff) = &entry.values {
-                                                    let kind = if diff.before.is_absent() {
-                                                        "A"
-                                                    } else if diff.after.is_absent() {
-                                                        "D"
-                                                    } else {
-                                                        "M"
-                                                    };
-                                                    summary.push_str(&format!("{kind} {}\n", path.as_internal_file_string()));
-                                                }
-                                            }
-                                            summary
-                                        })
-                                    } else {
-                                        String::new()
-                                    };
-                                    if let Some(tree) = out.new_tree {
+                            match run_command_on_commit(
+                                &mut ts,
+                                shell_command,
+                                &commit,
+                                base_ignores.clone(),
+                                readonly,
+                                &tx,
+                                new_trees,
+                            ) {
+                                Ok(new_tree) => {
+                                    let modified = new_tree.is_some();
+                                    if let Some(tree) = new_tree {
                                         new_trees.lock().unwrap().insert(cid.clone(), tree);
                                     }
                                     tx.send(TuiMessage::Passed {
-                                        commit_id: cid, modified, stdout: out.stdout, stderr: out.stderr, diff_summary,
-                                    }).ok();
+                                        commit_id: cid,
+                                        modified,
+                                    })
+                                    .ok();
                                 }
                                 Err(e) => {
-                                    let (stdout, stderr) = match &e {
-                                        RunError::CommandFailure { stdout, stderr, .. } => (stdout.clone(), stderr.clone()),
-                                        _ => (Vec::new(), Vec::new()),
-                                    };
+                                    if let RunError::CommandFailure {
+                                        new_tree: Some(ref tree),
+                                        ..
+                                    } = e
+                                    {
+                                        new_trees
+                                            .lock()
+                                            .unwrap()
+                                            .insert(cid.clone(), tree.clone());
+                                    }
                                     tx.send(TuiMessage::Failed {
-                                        commit_id: cid, message: e.to_string(), stdout, stderr,
-                                    }).ok();
+                                        commit_id: cid,
+                                        message: e.to_string(),
+                                    })
+                                    .ok();
                                     if !keep_going {
-                                        should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        should_stop.store(true, Ordering::Relaxed);
                                     }
                                     errors.lock().unwrap().push(e);
                                 }
@@ -691,8 +1092,9 @@ pub async fn cmd_run(
         })
     };
 
+    // TUI or text output.
     let use_tui = io::stdout().is_terminal();
-    let mut confirmed = true; // Non-TUI always confirms.
+    let mut confirmed = true;
 
     if use_tui {
         io::stdout().execute(EnterAlternateScreen)?;
@@ -701,34 +1103,48 @@ pub async fn cmd_run(
         terminal.clear()?;
 
         let mut tui_state = TuiState::new(&resolved_commits);
-        run_tui_loop(&mut terminal, &mut tui_state, &rx, &shell_command);
+        run_tui_loop(
+            &mut terminal,
+            &mut tui_state,
+            &rx,
+            &shell_command,
+            ui,
+            &workspace_command,
+            &resolved_commits,
+            &new_trees,
+        );
 
         disable_raw_mode()?;
         io::stdout().execute(LeaveAlternateScreen)?;
 
         confirmed = matches!(tui_state.outcome, Some(TuiOutcome::Confirm));
     } else {
-        // Non-interactive: just wait for all workers, printing status lines.
         for msg in &rx {
             match &msg {
-                TuiMessage::Passed { commit_id, modified, .. } => {
+                TuiMessage::Passed {
+                    commit_id,
+                    modified,
+                    ..
+                } => {
                     let m = if *modified { " (modified)" } else { "" };
                     writeln!(ui.status(), "  ✓ {}{m}", &commit_id.hex()[..12])?;
                 }
-                TuiMessage::Failed { commit_id, message, .. } => {
+                TuiMessage::Failed {
+                    commit_id, message, ..
+                } => {
                     writeln!(ui.status(), "  ✗ {} {message}", &commit_id.hex()[..12])?;
                 }
                 TuiMessage::AllDone => break,
-                TuiMessage::Started { .. } => {}
+                TuiMessage::Started { .. }
+                | TuiMessage::Output { .. }
+                | TuiMessage::DiffStat { .. } => {}
             }
         }
     }
 
-    // Signal workers to stop if user quit early, then wait.
-    should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    should_stop.store(true, Ordering::Relaxed);
     worker_handle.join().ok();
 
-    // Post-run summary.
     let rewritten = Arc::try_unwrap(new_trees).unwrap().into_inner().unwrap();
     let failures = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
 
@@ -742,15 +1158,36 @@ pub async fn cmd_run(
         writeln!(
             ui.status(),
             "Ran '{}' on {} commit(s) (readonly). {} passed, {} failed.",
-            args.shell_command, resolved_commits.len(), passed, failures.len(),
+            args.shell_command,
+            resolved_commits.len(),
+            passed,
+            failures.len(),
         )?;
         return Ok(());
     }
 
     if rewritten.is_empty() && failures.is_empty() {
-        writeln!(ui.status(), "No commits were rewritten (command did not modify any tracked files).")?;
+        writeln!(
+            ui.status(),
+            "No commits were rewritten (command did not modify any tracked files)."
+        )?;
         return Ok(());
     }
+
+    // Only rewrite commits that passed (failures are left in `rewritten` for
+    // diff display but should not be committed).
+    let failed_ids: std::collections::HashSet<_> = failures
+        .iter()
+        .filter_map(|e| match e {
+            RunError::CommandFailure { commit, .. } => Some(commit.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let rewritten: HashMap<_, _> = rewritten
+        .into_iter()
+        .filter(|(id, _)| !failed_ids.contains(id))
+        .collect();
 
     if !rewritten.is_empty() {
         let mut tx = workspace_command.start_transaction();
@@ -762,7 +1199,12 @@ pub async fn cmd_run(
                     let old_id = rewriter.old_commit().id().clone();
                     if let Some(new_tree) = rewritten.get(&old_id) {
                         count += 1;
-                        rewriter.rebase().await?.set_tree(new_tree.clone()).write().await?;
+                        rewriter
+                            .rebase()
+                            .await?
+                            .set_tree(new_tree.clone())
+                            .write()
+                            .await?;
                     } else {
                         rewriter.rebase().await?.write().await?;
                     }
@@ -771,18 +1213,29 @@ pub async fn cmd_run(
             )
             .await?;
 
-        writeln!(ui.status(), "Rewrote {count} commit(s) with '{}'.", args.shell_command)?;
+        writeln!(
+            ui.status(),
+            "Rewrote {count} commit(s) with '{}'.",
+            args.shell_command
+        )?;
 
         tx.finish(
             ui,
-            format!("run: rewrite {count} commit(s) with '{}'", args.shell_command),
+            format!(
+                "run: rewrite {count} commit(s) with '{}'",
+                args.shell_command
+            ),
         )
         .await?;
     }
 
     if !failures.is_empty() {
         if keep_going {
-            writeln!(ui.warning_default(), "{} commit(s) failed.", failures.len())?;
+            writeln!(
+                ui.warning_default(),
+                "{} commit(s) failed.",
+                failures.len()
+            )?;
         } else {
             return Err(failures.into_iter().next().unwrap().into());
         }
